@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: amd64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Linux system deps (amd64)
+        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'amd64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Install Linux cross-compilation deps (arm64)
+        if: matrix.os == 'ubuntu-latest' && matrix.arch == 'arm64'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-aarch64-linux-gnu \
+            pkg-config-aarch64-linux-gnu \
+            libwebkit2gtk-4.1-dev:arm64 \
+            libgtk-3-dev:arm64 \
+            libappindicator3-dev:arm64 \
+            librsvg2-dev:arm64 \
+            libssl-dev:arm64 \
+            libayatana-appindicator3-dev:arm64 \
+            patchelf
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+
+      - name: Setup MSVC arm64 toolchain (Windows)
+        if: matrix.os == 'windows-latest' && matrix.arch == 'arm64'
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -property installationPath
+          $msvcVersion = Get-ChildItem "$vsPath\VC\Tools\MSVC" | Select-Object -Last 1
+          $vcvarsall = "$vsPath\VC\Auxiliary\Build\vcvarsall.bat"
+          # Extract env vars from vcvarsall for arm64
+          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" |
+            Select-String '^LIB=' |
+            ForEach-Object { $_.Line } >> $env:GITHUB_ENV
+          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" |
+            Select-String '^LIBPATH=' |
+            ForEach-Object { $_.Line } >> $env:GITHUB_ENV
+          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" |
+            Select-String '^INCLUDE=' |
+            ForEach-Object { $_.Line } >> $env:GITHUB_ENV
+
+      - name: Build Tauri release bundle
+        id: tauri_build
+        uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "taura v${{ github.ref_name }}"
+          releaseBody: |
+            ## taura ${{ github.ref_name }}
+
+            ### Downloads
+
+            | Platform | Architecture | Installer |
+            |----------|-------------|----------|
+            | Linux | amd64 | `taura_${{ github.ref_name }}_amd64.AppImage` |
+            | Linux | arm64 | `taura_${{ github.ref_name }}_arm64.AppImage` |
+            | Windows | amd64 | `taura_${{ github.ref_name }}_x64.msi` |
+            | Windows | arm64 | `taura_${{ github.ref_name }}_arm64.msi` |
+            | macOS | arm64 | `taura_${{ github.ref_name }}_aarch64.dmg` |
+
+            ### Checksums
+
+            _Add SHA256 checksums after build._
+          releaseDraft: true
+          includeDebug: false
+          target: ${{ matrix.target }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taura-${{ matrix.arch }}-${{ matrix.os }}
+          path: ${{ steps.tauri_build.outputs.bundlePath }}
+          if-no-files-found: warn
