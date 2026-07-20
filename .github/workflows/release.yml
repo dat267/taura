@@ -34,6 +34,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
 
+    outputs:
+      bundle-path: ${{ steps.set_bundle_path.outputs.path }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -85,55 +88,72 @@ jobs:
 
       - name: Setup MSVC arm64 toolchain (Windows)
         if: matrix.os == 'windows-latest' && matrix.arch == 'arm64'
+        shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -property installationPath
-          $msvcVersion = Get-ChildItem "$vsPath\VC\Tools\MSVC" | Select-Object -Last 1
-          $vcvarsall = "$vsPath\VC\Auxiliary\Build\vcvarsall.bat"
-          # Extract env vars from vcvarsall for arm64
-          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" |
-            Select-String '^LIB=' |
-            ForEach-Object { $_.Line } >> $env:GITHUB_ENV
-          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" |
-            Select-String '^LIBPATH=' |
-            ForEach-Object { $_.Line } >> $env:GITHUB_ENV
-          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" |
-            Select-String '^INCLUDE=' |
-            ForEach-Object { $_.Line } >> $env:GITHUB_ENV
+          $vsPath = & "$vswhere" -latest -property installationPath
+          $vcvarsall = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          cmd /c "`"$vcvarsall`" amd64_arm64 > nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^(\w+)=(.*)') {
+              echo "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
 
-      - name: Build Tauri release bundle
-        id: tauri_build
-        uses: tauri-apps/tauri-action@v0
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "taura v${{ github.ref_name }}"
-          releaseBody: |
-            ## taura ${{ github.ref_name }}
-
-            ### Downloads
-
-            | Platform | Architecture | Installer |
-            |----------|-------------|----------|
-            | Linux | amd64 | `taura_${{ github.ref_name }}_amd64.AppImage` |
-            | Linux | arm64 | `taura_${{ github.ref_name }}_arm64.AppImage` |
-            | Windows | amd64 | `taura_${{ github.ref_name }}_x64.msi` |
-            | Windows | arm64 | `taura_${{ github.ref_name }}_arm64.msi` |
-            | macOS | arm64 | `taura_${{ github.ref_name }}_aarch64.dmg` |
-
-            ### Checksums
-
-            _Add SHA256 checksums after build._
-          releaseDraft: true
-          includeDebug: false
-          target: ${{ matrix.target }}
+      - name: Build Tauri bundle
+        id: build
+        run: npx tauri build --target ${{ matrix.target }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Set bundle path
+        id: set_bundle_path
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            echo "path=src-tauri/target/${{ matrix.target }}/release/bundle/appimage" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "path=src-tauri/target/${{ matrix.target }}/release/bundle/msi" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+            echo "path=src-tauri/target/${{ matrix.target }}/release/bundle/dmg" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: taura-${{ matrix.arch }}-${{ matrix.os }}
-          path: ${{ steps.tauri_build.outputs.bundlePath }}
+          path: ${{ steps.set_bundle_path.outputs.path }}
           if-no-files-found: warn
+
+  create-release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: List artifacts
+        run: ls -R taura-*/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: taura ${{ github.ref_name }}
+          body: |
+            ## taura ${{ github.ref_name }}
+
+            | Platform | Architecture | Installer |
+            |----------|-------------|----------|
+            | Linux | amd64 | `taura-${{ github.ref_name }}-amd64.AppImage` |
+            | Linux | arm64 | `taura-${{ github.ref_name }}-arm64.AppImage` |
+            | Windows | amd64 | `taura-${{ github.ref_name }}-x64.msi` |
+            | Windows | arm64 | `taura-${{ github.ref_name }}-arm64.msi` |
+            | macOS | arm64 | `taura-${{ github.ref_name }}-aarch64.dmg` |
+          draft: true
+          files: taura-*/*
+          fail_on_unmatched_files: false
